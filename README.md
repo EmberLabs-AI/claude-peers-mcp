@@ -107,11 +107,55 @@ bun cli.ts kill-broker       # stop the broker
 
 ## Configuration
 
-| Environment variable | Default              | Description                           |
-| -------------------- | -------------------- | ------------------------------------- |
-| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
-| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
-| `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| Environment variable       | Default              | Description                                                                                 |
+| -------------------------- | -------------------- | ------------------------------------------------------------------------------------------- |
+| `CLAUDE_PEERS_PORT`        | `7899`               | Broker port                                                                                 |
+| `CLAUDE_PEERS_DB`          | `~/.claude-peers.db` | SQLite database path                                                                        |
+| `CLAUDE_PEERS_BROKER_URL`  | `http://127.0.0.1:$CLAUDE_PEERS_PORT` | Point a remote MCP at a different broker (e.g., over Tailscale)            |
+| `CLAUDE_PEERS_BIND`        | `0.0.0.0`            | Broker bind address                                                                         |
+| `CLAUDE_PEERS_MODE`        | `auto`               | `auto` pushes messages via channel + polls every 1s. `pull` disables polling — see below.  |
+| `OPENAI_API_KEY`           | —                    | Enables auto-summary via gpt-5.4-nano                                                       |
+
+## Pull mode (Desktop App / no channel subscription)
+
+`notifications/claude/channel` only surfaces in sessions launched with
+`--dangerously-load-development-channels server:claude-peers`. If the host
+can't pass that flag (most commonly the Claude Desktop App), channel pushes
+evaporate and inbound messages go missing.
+
+Set `CLAUDE_PEERS_MODE=pull` in the MCP server env to disable the poll loop.
+Messages accumulate in the broker until `check_messages` is called, which
+becomes the sole drain path.
+
+Add a Stop hook so `check_messages` runs automatically at the end of every
+turn — new peer messages surface on the user's next tool turn without them
+having to think about it. In `~/.claude/settings.json`:
+
+```jsonc
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude mcp call claude-peers check_messages || true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Configure the MCP env when you register the server:
+
+```bash
+claude mcp add --scope user --transport stdio claude-peers \
+  --env CLAUDE_PEERS_MODE=pull \
+  -- bun ~/claude-peers-mcp/server.ts
+```
 
 ## Requirements
 
