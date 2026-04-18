@@ -19,6 +19,7 @@ import type {
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  AckMessagesRequest,
   Peer,
   Message,
 } from "./shared/types.ts";
@@ -120,6 +121,10 @@ const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
 `);
 
+const markDeliveredForPeer = db.prepare(`
+  UPDATE messages SET delivered = 1 WHERE id = ? AND to_id = ?
+`);
+
 // --- Generate peer ID ---
 
 function generateId(): string {
@@ -205,12 +210,28 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const messages = selectUndelivered.all(body.id) as Message[];
 
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
+  // Default behavior (ack !== false) marks delivered immediately — preserves
+  // backwards compatibility with older server.ts clients that don't call /ack.
+  // New clients pass ack: false and call /ack explicitly after they've
+  // surfaced each message to the LLM, so failed channel pushes don't evaporate
+  // queue entries.
+  if (body.ack !== false) {
+    for (const msg of messages) {
+      markDelivered.run(msg.id);
+    }
   }
 
   return { messages };
+}
+
+function handleAckMessages(body: AckMessagesRequest, peerId: string): { ok: boolean; acked: number } {
+  // Scope ACKs to the peer's own inbox to prevent cross-peer tampering.
+  let acked = 0;
+  for (const id of body.ids) {
+    const result = markDeliveredForPeer.run(id, peerId);
+    if (result.changes > 0) acked++;
+  }
+  return { ok: true, acked };
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -251,6 +272,13 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/ack": {
+          const ackBody = body as AckMessagesRequest;
+          if (!ackBody.id || !Array.isArray(ackBody.ids)) {
+            return Response.json({ error: "invalid ack request" }, { status: 400 });
+          }
+          return Response.json(handleAckMessages(ackBody, ackBody.id));
+        }
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
