@@ -60,8 +60,17 @@ export interface SendMessageRequest {
 
 export interface PollMessagesRequest {
   id: PeerId;
+  // If false, the broker returns undelivered messages WITHOUT marking them
+  // delivered. The caller must then call /ack with the message IDs it handled.
+  // Default true preserves the original behavior for older clients.
+  ack?: boolean;
 }
 
 export interface PollMessagesResponse {
   messages: Message[];
+}
+
+export interface AckMessagesRequest {
+  id: PeerId;
+  ids: number[];
 }

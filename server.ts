@@ -40,6 +40,15 @@ const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
+// CLAUDE_PEERS_MODE: "auto" (default) polls the broker every 1s and pushes
+// messages to the host via notifications/claude/channel. "pull" disables the
+// poll loop entirely — the check_messages tool becomes the sole drain path.
+// Use "pull" when the host can't subscribe to dev channels (e.g., Desktop App
+// without --dangerously-load-development-channels). Pair with a Stop hook that
+// auto-calls check_messages on turn end so messages surface on the next tool turn.
+const RAW_MODE = (process.env.CLAUDE_PEERS_MODE ?? "auto").toLowerCase();
+const MODE: "auto" | "pull" = RAW_MODE === "pull" ? "pull" : "auto";
+
 // --- Broker communication ---
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
@@ -138,6 +147,21 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+
+// Messages claimed from the broker but not yet ACKed. Prevents double-surface
+// when the poll loop and the check_messages tool race for the same message.
+const inFlightAcks = new Set<number>();
+
+async function ackMessages(ids: number[]): Promise<void> {
+  if (!myId || ids.length === 0) return;
+  try {
+    await brokerFetch("/ack", { id: myId, ids });
+  } catch (e) {
+    log(`Ack error (ids=${ids.join(",")}): ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    for (const id of ids) inFlightAcks.delete(id);
+  }
+}
 
 // --- MCP Server ---
 
@@ -364,20 +388,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-        if (result.messages.length === 0) {
+        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", {
+          id: myId,
+          ack: false,
+        });
+        // Exclude messages the poll loop has already pushed via channel and is
+        // about to ack — they're in the conversation, no need to re-surface.
+        const surfaced = result.messages.filter((m) => !inFlightAcks.has(m.id));
+        if (surfaced.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
-        const lines = result.messages.map(
+        await ackMessages(surfaced.map((m) => m.id));
+        const lines = surfaced.map(
           (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
         );
         return {
           content: [
             {
               type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+              text: `${surfaced.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
             },
           ],
         };
@@ -405,9 +436,17 @@ async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", {
+      id: myId,
+      ack: false,
+    });
 
-    for (const msg of result.messages) {
+    // Skip anything the check_messages tool is already handling.
+    const fresh = result.messages.filter((m) => !inFlightAcks.has(m.id));
+    if (fresh.length === 0) return;
+    for (const msg of fresh) inFlightAcks.add(msg.id);
+
+    for (const msg of fresh) {
       // Look up the sender's info for context
       let fromSummary = "";
       let fromCwd = "";
@@ -442,6 +481,12 @@ async function pollAndPushMessages() {
 
       log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
     }
+
+    // Optimistic ACK — there's no receipt primitive for channel notifications,
+    // so we assume success. If the host isn't subscribed to dev channels, the
+    // push silently evaporates; users who hit that should set
+    // CLAUDE_PEERS_MODE=pull to disable this loop and rely on check_messages.
+    await ackMessages(fresh.map((m) => m.id));
   } catch (e) {
     // Broker might be down temporarily, don't crash
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
@@ -513,11 +558,29 @@ async function main() {
   }
 
   // 5. Connect MCP over stdio
+  // Detection experiment: log what the client advertised during initialize.
+  // If flagged (--dangerously-load-development-channels) vs unflagged launches
+  // differ, we can eventually detect channel-push support automatically
+  // instead of requiring CLAUDE_PEERS_MODE.
+  mcp.oninitialized = () => {
+    try {
+      const caps = mcp.getClientCapabilities();
+      log(`Client capabilities: ${JSON.stringify(caps ?? {})}`);
+    } catch (e) {
+      log(`Could not read client capabilities: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // 6. Start polling for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+  // 6. Start polling for inbound messages (auto mode only)
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  if (MODE === "auto") {
+    pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+    log(`Auto-poll enabled (CLAUDE_PEERS_MODE=auto, interval=${POLL_INTERVAL_MS}ms)`);
+  } else {
+    log("Auto-poll disabled (CLAUDE_PEERS_MODE=pull); check_messages is the sole drain path");
+  }
 
   // 7. Start heartbeat
   const heartbeatTimer = setInterval(async () => {
@@ -532,7 +595,7 @@ async function main() {
 
   // 8. Clean up on exit
   const cleanup = async () => {
-    clearInterval(pollTimer);
+    if (pollTimer) clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
     if (myId) {
       try {

@@ -19,6 +19,7 @@ import type {
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  AckMessagesRequest,
   Peer,
   Message,
 } from "./shared/types.ts";
@@ -58,18 +59,16 @@ db.run(`
   )
 `);
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+// Stale peers are determined by heartbeat freshness, not PID existence —
+// process.kill(pid, 0) only works for local PIDs and wrongly prunes cross-machine peers.
+const STALE_PEER_MS = 60_000;
+
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
-  for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
-      db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
-    }
+  const cutoff = new Date(Date.now() - STALE_PEER_MS).toISOString();
+  const stale = db.query("SELECT id FROM peers WHERE last_seen < ?").all(cutoff) as { id: string }[];
+  for (const peer of stale) {
+    db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
+    db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
   }
 }
 
@@ -120,6 +119,10 @@ const selectUndelivered = db.prepare(`
 
 const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
+`);
+
+const markDeliveredForPeer = db.prepare(`
+  UPDATE messages SET delivered = 1 WHERE id = ? AND to_id = ?
 `);
 
 // --- Generate peer ID ---
@@ -184,16 +187,12 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
+  // Filter by heartbeat freshness (works for local and cross-machine peers)
+  const cutoff = Date.now() - STALE_PEER_MS;
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
-      deletePeer.run(p.id);
-      return false;
-    }
+    if (new Date(p.last_seen).getTime() >= cutoff) return true;
+    deletePeer.run(p.id);
+    return false;
   });
 }
 
@@ -211,12 +210,28 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const messages = selectUndelivered.all(body.id) as Message[];
 
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
+  // Default behavior (ack !== false) marks delivered immediately — preserves
+  // backwards compatibility with older server.ts clients that don't call /ack.
+  // New clients pass ack: false and call /ack explicitly after they've
+  // surfaced each message to the LLM, so failed channel pushes don't evaporate
+  // queue entries.
+  if (body.ack !== false) {
+    for (const msg of messages) {
+      markDelivered.run(msg.id);
+    }
   }
 
   return { messages };
+}
+
+function handleAckMessages(body: AckMessagesRequest, peerId: string): { ok: boolean; acked: number } {
+  // Scope ACKs to the peer's own inbox to prevent cross-peer tampering.
+  let acked = 0;
+  for (const id of body.ids) {
+    const result = markDeliveredForPeer.run(id, peerId);
+    if (result.changes > 0) acked++;
+  }
+  return { ok: true, acked };
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -257,6 +272,13 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/ack": {
+          const ackBody = body as AckMessagesRequest;
+          if (!ackBody.id || !Array.isArray(ackBody.ids)) {
+            return Response.json({ error: "invalid ack request" }, { status: 400 });
+          }
+          return Response.json(handleAckMessages(ackBody, ackBody.id));
+        }
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
