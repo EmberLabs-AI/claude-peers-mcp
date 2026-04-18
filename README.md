@@ -127,27 +127,11 @@ Set `CLAUDE_PEERS_MODE=pull` in the MCP server env to disable the poll loop.
 Messages accumulate in the broker until `check_messages` is called, which
 becomes the sole drain path.
 
-Add a Stop hook so `check_messages` runs automatically at the end of every
-turn — new peer messages surface on the user's next tool turn without them
-having to think about it. In `~/.claude/settings.json`:
-
-```jsonc
-{
-  "hooks": {
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "claude mcp call claude-peers check_messages || true"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+> **Heads up:** pull mode currently requires the user (or Claude) to invoke
+> `check_messages` manually from inside a session to drain queued messages.
+> Automatic drain via a `UserPromptSubmit` hook is being designed — it needs
+> a session-id-keyed peer ID mapping and verified hook stdin semantics
+> before it can ship. Track progress in the repo issues.
 
 Configure the MCP env when you register the server:
 
