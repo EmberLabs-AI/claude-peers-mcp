@@ -13,6 +13,7 @@
  *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
  */
 
+import { hostname } from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -22,7 +23,9 @@ import {
 import type {
   PeerId,
   Peer,
+  RegisterRequest,
   RegisterResponse,
+  HeartbeatResponse,
   PollMessagesResponse,
   Message,
 } from "./shared/types.ts";
@@ -147,6 +150,12 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// Stable host identifier — used by the broker to scope PID-based dedup
+// to this machine only (fixes EMB-591 cross-machine pid collisions).
+const myMachineId = hostname();
+// Stashed for re-registration if the broker signals stale on heartbeat.
+let myTty: string | null = null;
+let mySummary = "";
 
 // Messages claimed from the broker but not yet ACKed. Prevents double-surface
 // when the poll loop and the check_messages tool race for the same message.
@@ -533,20 +542,24 @@ async function main() {
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
   // 4. Register with broker
+  myTty = tty;
+  mySummary = initialSummary;
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
-  });
+    machine_id: myMachineId,
+  } satisfies RegisterRequest);
   myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  log(`Registered as peer ${myId} (machine_id=${myMachineId})`);
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
     summaryPromise.then(async () => {
       if (initialSummary && myId) {
+        mySummary = initialSummary;
         try {
           await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
           log(`Late auto-summary applied: ${initialSummary}`);
@@ -582,14 +595,28 @@ async function main() {
     log("Auto-poll disabled (CLAUDE_PEERS_MODE=pull); check_messages is the sole drain path");
   }
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat. If the broker reports stale (our peer row got
+  // evicted — typically by another /register call with a colliding pid,
+  // pre-EMB-591-fix), re-register rather than heartbeat into the void.
   const heartbeatTimer = setInterval(async () => {
-    if (myId) {
-      try {
-        await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
+    if (!myId) return;
+    try {
+      const res = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId });
+      if (res.stale) {
+        log(`Heartbeat reported stale — re-registering with broker`);
+        const reg = await brokerFetch<RegisterResponse>("/register", {
+          pid: process.pid,
+          cwd: myCwd,
+          git_root: myGitRoot,
+          tty: myTty,
+          summary: mySummary,
+          machine_id: myMachineId,
+        } satisfies RegisterRequest);
+        myId = reg.id;
+        log(`Re-registered as peer ${myId}`);
       }
+    } catch {
+      // Non-critical — broker may be briefly unavailable.
     }
   }, HEARTBEAT_INTERVAL_MS);
 

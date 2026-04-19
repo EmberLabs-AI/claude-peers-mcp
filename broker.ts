@@ -42,9 +42,17 @@ db.run(`
     tty TEXT,
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL
+    last_seen TEXT NOT NULL,
+    machine_id TEXT NOT NULL DEFAULT ''
   )
 `);
+
+// Migrate pre-EMB-591 DBs: add machine_id column if it doesn't exist.
+// SQLite ALTER TABLE is idempotent only if we guard on current schema.
+const peerCols = db.query("PRAGMA table_info(peers)").all() as { name: string }[];
+if (!peerCols.some((c) => c.name === "machine_id")) {
+  db.run("ALTER TABLE peers ADD COLUMN machine_id TEXT NOT NULL DEFAULT ''");
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -80,8 +88,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, machine_id)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -141,19 +149,38 @@ function generateId(): string {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
+  // Backwards compat: older clients omit machine_id. Treat as empty string
+  // so their peers share a single "unknown-host" bucket, which keeps the
+  // legacy single-machine behavior intact for same-host PID collisions
+  // while no longer evicting peers on OTHER hosts.
+  const machineId = body.machine_id ?? "";
 
-  // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+  // Dedup only within the SAME host. Previously the broker dedup'd on pid
+  // alone, which silently evicted cross-machine peers whenever two macOS
+  // hosts happened to produce the same ~15-17 bit pid — the root cause of
+  // EMB-591.
+  const existing = db
+    .query("SELECT id FROM peers WHERE pid = ? AND machine_id = ?")
+    .get(body.pid, machineId) as { id: string } | null;
   if (existing) {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, machineId);
   return { id };
 }
 
-function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+function handleHeartbeat(body: HeartbeatRequest): { ok: boolean; stale?: boolean } {
+  const result = updateLastSeen.run(new Date().toISOString(), body.id);
+  // Zero rows affected means the client's peer id no longer exists —
+  // typically because another /register call from a colliding pid evicted
+  // it. Signal stale so the client can re-register instead of sending
+  // heartbeats into the void forever. The client-side recovery path was
+  // the missing half of the EMB-591 fix.
+  if (result.changes === 0) {
+    return { ok: false, stale: true };
+  }
+  return { ok: true };
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
@@ -261,8 +288,7 @@ Bun.serve({
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
         case "/heartbeat":
-          handleHeartbeat(body as HeartbeatRequest);
-          return Response.json({ ok: true });
+          return Response.json(handleHeartbeat(body as HeartbeatRequest));
         case "/set-summary":
           handleSetSummary(body as SetSummaryRequest);
           return Response.json({ ok: true });

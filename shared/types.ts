@@ -29,6 +29,11 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  // Host identifier (os.hostname()). Required for cross-machine peer
+  // uniqueness — PIDs alone collide across machines since each host has
+  // its own ~15-17 bit PID space. Optional on the wire for backwards compat
+  // with pre-fix clients; broker treats missing/empty as "unknown-host".
+  machine_id?: string;
 }
 
 export interface RegisterResponse {
@@ -37,6 +42,15 @@ export interface RegisterResponse {
 
 export interface HeartbeatRequest {
   id: PeerId;
+}
+
+export interface HeartbeatResponse {
+  ok: boolean;
+  // When true, the broker's heartbeat UPDATE affected 0 rows — the peer id
+  // no longer exists in the registry (most likely evicted by another
+  // client's /register call with a colliding pid). Client should treat
+  // this as a signal to re-run /register with its full context.
+  stale?: boolean;
 }
 
 export interface SetSummaryRequest {
